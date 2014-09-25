@@ -45,12 +45,23 @@ struct LocalNode
     LocalNode(const Collection &col)
         : collection(col)
         , processed(false)
+        , parentNode(0)
     {}
 
     ~LocalNode()
     {
         qDeleteAll(childNodes);
         qDeleteAll(pendingRemoteNodes);
+    }
+
+    void appendChild(LocalNode *childNode)
+    {
+        childNode->parentNode = this;
+        childNodes.append(childNode);
+        if (!childNode->collection.remoteId().isEmpty()) {
+            childRidMap.insert(childNode->collection.remoteId(), childNode);
+            childNameMap.insert(childNode->collection.name(), childNode);
+        }
     }
 
     Collection collection;
@@ -62,6 +73,7 @@ struct LocalNode
         child node is added. */
     QList<RemoteNode *> pendingRemoteNodes;
     bool processed;
+    LocalNode *parentNode;
 };
 
 Q_DECLARE_METATYPE(LocalNode *)
@@ -117,6 +129,7 @@ public:
     {
         delete localRoot;
         localRoot = new LocalNode(Collection::root());
+        localRoot->parentNode = 0;
         localRoot->processed = true; // never try to delete that one
         if (currentTransaction) {
             // we are running the update transaction, initialize pending remote nodes
@@ -126,9 +139,7 @@ public:
         localUidMap.clear();
         localRidMap.clear();
         localUidMap.insert(localRoot->collection.id(), localRoot);
-        if (!hierarchicalRIDs) {
-            localRidMap.insert(QString(), localRoot);
-        }
+        localRidMap.insert(QString(), localRoot);
     }
 
     /** Create a local node from the given local collection and integrate it into the local tree structure. */
@@ -137,8 +148,12 @@ public:
         LocalNode *node = new LocalNode(col);
         Q_ASSERT(!localUidMap.contains(col.id()));
         localUidMap.insert(node->collection.id(), node);
-        if (!hierarchicalRIDs && !col.remoteId().isEmpty()) {
-            localRidMap.insert(node->collection.remoteId(), node);
+        if (!col.remoteId().isEmpty()) {
+            if (!hierarchicalRIDs) {
+                localRidMap.insert(node->collection.remoteId(), node);
+            } else {
+                localRidMap.insertMulti(node->collection.remoteId(), node);
+            }
         }
 
         // add already existing children
@@ -147,22 +162,14 @@ public:
             foreach (Collection::Id childId, childIds) {
                 Q_ASSERT(localUidMap.contains(childId));
                 LocalNode *childNode = localUidMap.value(childId);
-                node->childNodes.append(childNode);
-                if (!childNode->collection.remoteId().isEmpty()) {
-                    node->childRidMap.insert(childNode->collection.remoteId(), childNode);
-                    node->childNameMap.insert(childNode->collection.name(), childNode);
-                }
+                node->appendChild(childNode);
             }
         }
 
         // set our parent and add ourselves as child
         if (localUidMap.contains(col.parentCollection().id())) {
             LocalNode *parentNode = localUidMap.value(col.parentCollection().id());
-            parentNode->childNodes.append(node);
-            if (!node->collection.remoteId().isEmpty()) {
-                parentNode->childRidMap.insert(node->collection.remoteId(), node);
-                parentNode->childNameMap.insert(node->collection.name(), node);
-            }
+            parentNode->appendChild(node);
         } else {
             localPendingCollections[col.parentCollection().id()].append(col.id());
         }
@@ -232,6 +239,42 @@ public:
         return 0;
     }
 
+    LocalNode *findMatchingLocalNodeFromCandidates(const Collection &collection, const QSet<LocalNode *> &candidates) const
+    {
+        QSet<LocalNode *> suitableParents;
+        const QString parentRid = collection.parentRemoteId();
+        Q_FOREACH (LocalNode *candidate, candidates) {
+            if (candidate->parentNode) {
+                LocalNode *parentNode = candidate->parentNode;
+                if (parentNode->collection.remoteId() == parentRid) {
+                    suitableParents.insert(parentNode);
+                }
+            } else {
+                if (collection.parentCollection().id() == Collection::root().id() || parentRid == Collection::root().remoteId()) {
+                    suitableParents.insert(localRoot);
+                }
+            }
+        }
+
+        LocalNode *parentNode = 0;
+        if (suitableParents.isEmpty()) {
+            return 0;
+
+        // TODO: Should we try to match the candidate by the entire ancestor chain?
+        } else if (suitableParents.count() == 1) {
+            parentNode = *suitableParents.begin();
+        } else {
+            parentNode = findMatchingLocalNodeFromCandidates(collection.parentCollection(), suitableParents);
+        }
+
+        if (parentNode) {
+            return parentNode->childRidMap.value(collection.remoteId(), 0);
+        }
+
+        return 0;
+    }
+
+
     /**
       Find the local node that matches the given remote collection, returns 0
       if that doesn't exist (yet).
@@ -239,37 +282,28 @@ public:
     LocalNode *findMatchingLocalNode(const Collection &collection) const
     {
         if (!hierarchicalRIDs) {
-            if (localRidMap.contains(collection.remoteId())) {
-                return localRidMap.value(collection.remoteId());
-            }
-            return 0;
+            return localRidMap.value(collection.remoteId(), 0);
         } else {
             if (collection.id() == Collection::root().id() || collection.remoteId() == Collection::root().remoteId()) {
                 return localRoot;
             }
-            LocalNode *localParent = 0;
-            if (collection.parentCollection().id() < 0 && collection.parentCollection().remoteId().isEmpty()) {
-                kWarning() << "Remote collection without valid parent found: " << collection;
-                return 0;
-            }
-            if (collection.parentCollection().id() == Collection::root().id() || collection.parentCollection().remoteId() == Collection::root().remoteId()) {
-                localParent = localRoot;
-            } else {
-                localParent = findMatchingLocalNode(collection.parentCollection());
-            }
 
-            if (localParent) {
-                if (localParent->childRidMap.contains(collection.remoteId())) {
-                    return localParent->childRidMap.value(collection.remoteId());
+            QSet<LocalNode*> candidates = localRidMap.values(collection.remoteId()).toSet();
+            if (!candidates.isEmpty()) {
+                return findMatchingLocalNodeFromCandidates(collection, candidates);
+            } else {
+                LocalNode *localParent = findMatchingLocalNode(collection.parentCollection());
+                if (!localParent) {
+                    return 0;
                 }
-                // check if we have a local folder with a matching name and no RID, if so let's use that one
-                // we would get an error if we don't do this anyway, as we'd try to create two sibling nodes with the same name
+
                 if (LocalNode *recoveredLocalNode = findLocalChildNodeByName(localParent, collection.name())) {
                     kDebug() << "Recovering collection with lost RID:" << collection << recoveredLocalNode->collection;
                     return recoveredLocalNode;
                 }
+
+                return 0;
             }
-            return 0;
         }
     }
 
