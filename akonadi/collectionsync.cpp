@@ -239,7 +239,8 @@ public:
         return 0;
     }
 
-    LocalNode *findMatchingLocalNodeFromCandidates(const Collection &collection, const QSet<LocalNode *> &candidates) const
+    template<typename T>
+    QPair<LocalNode * /*node*/, LocalNode * /*parent*/> findMatchingLocalNodeFromCandidates(const Collection &collection, const T &candidates) const
     {
         QSet<LocalNode *> suitableParents;
         const Collection parentCollection = collection.parentCollection();
@@ -251,29 +252,29 @@ public:
                 if (parentNode->collection.remoteId() == parentRid) {
                     suitableParents.insert(parentNode);
                 }
+            } else if (parentCollection.id() == root.id() || parentRid == root.remoteId()) {
+                suitableParents.insert(localRoot);
             } else {
-                if (parentCollection.id() == root.id() || parentRid == root.remoteId()) {
-                    suitableParents.insert(localRoot);
-                }
+                /* not a suitable candidate */
             }
         }
 
         LocalNode *parentNode = 0;
         if (suitableParents.isEmpty()) {
-            return 0;
-
-        // TODO: Should we try to match the candidate by the entire ancestor chain?
+            return qMakePair<LocalNode *, LocalNode *>(0, 0);
         } else if (suitableParents.count() == 1) {
+            // TODO: Should we try to match the candidate by the entire ancestor chain?
             parentNode = *suitableParents.begin();
         } else {
-            parentNode = findMatchingLocalNodeFromCandidates(parentCollection, suitableParents);
+            const QPair<LocalNode *, LocalNode *> pair = findMatchingLocalNodeFromCandidates(parentCollection, suitableParents);
+            parentNode = pair.first;
         }
 
         if (parentNode) {
-            return parentNode->childRidMap.value(collection.remoteId(), 0);
+            return qMakePair(parentNode->childRidMap.value(collection.remoteId(), 0), parentNode);
         }
 
-        return 0;
+        return qMakePair<LocalNode *, LocalNode *>(0, 0);
     }
 
 
@@ -281,31 +282,36 @@ public:
       Find the local node that matches the given remote collection, returns 0
       if that doesn't exist (yet).
     */
-    LocalNode *findMatchingLocalNode(const Collection &collection) const
+    QPair<LocalNode * /*node*/, LocalNode * /*parent*/> findMatchingLocalNode(const Collection &collection) const
     {
         if (!hierarchicalRIDs) {
-            return localRidMap.value(collection.remoteId(), 0);
+            LocalNode *node = localRidMap.value(collection.remoteId(), 0);
+            return qMakePair(node, node ? node->parentNode : localRidMap.value(collection.parentRemoteId(), 0));
         } else {
             if (collection.id() == Collection::root().id() || collection.remoteId() == Collection::root().remoteId()) {
-                return localRoot;
+                return qMakePair(localRoot, (LocalNode *)0);
             }
 
-            QSet<LocalNode*> candidates = localRidMap.values(collection.remoteId()).toSet();
+            const QList<LocalNode*> candidates = localRidMap.values(collection.remoteId());
             if (!candidates.isEmpty()) {
-                return findMatchingLocalNodeFromCandidates(collection, candidates);
-            } else {
-                LocalNode *localParent = findMatchingLocalNode(collection.parentCollection());
-                if (!localParent) {
-                    return 0;
+                const QPair<LocalNode *, LocalNode *> pair = findMatchingLocalNodeFromCandidates(collection, candidates);
+                if (pair.first && pair.second) {
+                    return pair;
                 }
-
-                if (LocalNode *recoveredLocalNode = findLocalChildNodeByName(localParent, collection.name())) {
-                    kDebug() << "Recovering collection with lost RID:" << collection << recoveredLocalNode->collection;
-                    return recoveredLocalNode;
-                }
-
-                return 0;
             }
+
+            const QPair<LocalNode *, LocalNode *> pair = findMatchingLocalNode(collection.parentCollection());
+            LocalNode *localParent = pair.first;
+            if (!localParent) {
+                return qMakePair<LocalNode *, LocalNode *>(0, 0);
+            }
+
+            if (LocalNode *recoveredLocalNode = findLocalChildNodeByName(localParent, collection.name())) {
+                kDebug() << "Recovering collection with lost RID:" << collection << recoveredLocalNode->collection;
+                return qMakePair(recoveredLocalNode, localParent);
+            }
+
+            return qMakePair((LocalNode *)0, localParent);
         }
     }
 
@@ -362,7 +368,8 @@ public:
 
         foreach (RemoteNode *remoteNode, rootRemoteNodes) {
             // every remote note should have a local node already
-            LocalNode *localNode = findMatchingLocalNode(remoteNode->collection);
+            const QPair<LocalNode *, LocalNode *> nodePair = findMatchingLocalNode(remoteNode->collection);
+            const LocalNode *localNode = nodePair.first;
             if (localNode) {
                 if (checkLocalCollection(localNode, remoteNode)) {
                     return true;
@@ -386,14 +393,15 @@ public:
         QHash<LocalNode *, QList<RemoteNode *> > pendingCreations;
         foreach (RemoteNode *remoteNode, pendingRemoteNodes) {
             // step 1: see if we have a matching local node already
-            LocalNode *localNode = findMatchingLocalNode(remoteNode->collection);
+            const QPair<LocalNode *, LocalNode *> nodes = findMatchingLocalNode(remoteNode->collection);
+            LocalNode *localNode = nodes.first;
             if (localNode) {
                 Q_ASSERT(!localNode->processed);
                 updateLocalCollection(localNode, remoteNode);
                 continue;
             }
             // step 2: check if we have the parent at least, then we can create it
-            localNode = findMatchingLocalNode(remoteNode->collection.parentCollection());
+            localNode = nodes.second;
             if (localNode) {
                 pendingCreations[localNode].append(remoteNode);
                 continue;
@@ -504,13 +512,15 @@ public:
 
         // detecting moves is only possible with global RIDs
         if (!hierarchicalRIDs) {
-            LocalNode *oldParent = localUidMap.value(localNode->collection.parentCollection().id());
-            LocalNode *newParent = findMatchingLocalNode(remoteNode->collection.parentCollection());
+            const LocalNode *oldParent = localUidMap.value(localNode->collection.parentCollection().id());
+            const QPair<LocalNode *, LocalNode *> nodes = findMatchingLocalNode(remoteNode->collection.parentCollection());
+            const LocalNode *newParent = nodes.first;
             // TODO: handle the newParent == 0 case correctly, ie. defer the move until the new
             // local parent has been created
             if (newParent && oldParent != newParent) {
                 ++pendingJobs;
                 CollectionMoveJob *move = new CollectionMoveJob(upd, newParent->collection, currentTransaction);
+                //move->setProperty("collection", QVariant::fromValue(upd));
                 connect(move, SIGNAL(result(KJob*)), q, SLOT(updateLocalCollectionResult(KJob*)));
             }
         }
@@ -526,7 +536,12 @@ public:
             return; // handled by the base class
         }
         if (qobject_cast<CollectionModifyJob *>(job)) {
+            //const Collection col = qobject_cast<CollectionModifyJob*>(job)->collection();
+            //qDebug() << "== Updated collection" << col.parentRemoteId() << col.remoteId();
             ++progress;
+        } else {
+            //const Collection col = job->property("collection").value<Collection>();
+            //qDebug() << "== Moved collection" << col.parentRemoteId() << col.remoteId();
         }
         checkDone();
     }
@@ -564,6 +579,7 @@ public:
         }
 
         const Collection newLocal = static_cast<CollectionCreateJob *>(job)->collection();
+        //qDebug() << "== Created collection" << newLocal.parentRemoteId() << newLocal.remoteId();
         LocalNode *localNode = createLocalNode(newLocal);
         localNode->processed = true;
 
@@ -650,6 +666,7 @@ public:
             ++pendingJobs;
             Q_ASSERT(currentTransaction);
             CollectionDeleteJob *job = new CollectionDeleteJob(col, currentTransaction);
+            //job->setProperty("collection", QVariant::fromValue(col));
             connect(job, SIGNAL(result(KJob*)), q, SLOT(deleteLocalCollectionsResult(KJob*)));
 
             // It can happen that the groupware servers report us deleted collections
@@ -660,10 +677,14 @@ public:
         }
     }
 
-    void deleteLocalCollectionsResult(KJob *)
+    void deleteLocalCollectionsResult(KJob *job)
     {
+        Q_UNUSED(job);
+
         --pendingJobs;
 
+        //const Collection col = job->property("collection").value<Collection>();
+        //qDebug() << "== Deleted collection" << col.parentRemoteId() << col.remoteId();
         ++progress;
         checkDone();
     }
@@ -739,7 +760,8 @@ public:
         } else {
             Collection::List localCols;
             foreach (const Collection &c, removedRemoteCollections) {
-                LocalNode *node = findMatchingLocalNode(c);
+                const QPair<LocalNode *, LocalNode *> nodePair = findMatchingLocalNode(c);
+                const LocalNode *node = nodePair.first;
                 if (node) {
                     localCols.append(node->collection);
                 }
