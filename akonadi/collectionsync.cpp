@@ -242,7 +242,9 @@ public:
     LocalNode *findMatchingLocalNodeFromCandidates(const Collection &collection, const QSet<LocalNode *> &candidates) const
     {
         QSet<LocalNode *> suitableParents;
-        const QString parentRid = collection.parentRemoteId();
+        const Collection parentCollection = collection.parentCollection();
+        const QString parentRid = parentCollection.remoteId();
+        const Collection root = Collection::root();
         Q_FOREACH (LocalNode *candidate, candidates) {
             if (candidate->parentNode) {
                 LocalNode *parentNode = candidate->parentNode;
@@ -250,7 +252,7 @@ public:
                     suitableParents.insert(parentNode);
                 }
             } else {
-                if (collection.parentCollection().id() == Collection::root().id() || parentRid == Collection::root().remoteId()) {
+                if (parentCollection.id() == root.id() || parentRid == root.remoteId()) {
                     suitableParents.insert(localRoot);
                 }
             }
@@ -264,7 +266,7 @@ public:
         } else if (suitableParents.count() == 1) {
             parentNode = *suitableParents.begin();
         } else {
-            parentNode = findMatchingLocalNodeFromCandidates(collection.parentCollection(), suitableParents);
+            parentNode = findMatchingLocalNodeFromCandidates(parentCollection, suitableParents);
         }
 
         if (parentNode) {
@@ -323,23 +325,25 @@ public:
             }
             return localRoot;
         }
-        if (collection.parentCollection().id() < 0 && collection.parentCollection().remoteId().isEmpty()) {
+        const Collection parentCollection = collection.parentCollection();
+        if (parentCollection.id() < 0 && parentCollection.remoteId().isEmpty()) {
             kWarning() << "Remote collection without valid parent found: " << collection;
             return 0;
         }
         bool parentIsExact = false;
-        LocalNode *localParent = findBestLocalAncestor(collection.parentCollection(), &parentIsExact);
+        LocalNode *localParent = findBestLocalAncestor(parentCollection, &parentIsExact);
         if (!parentIsExact) {
             if (exactMatch) {
                 *exactMatch = false;
             }
             return localParent;
         }
-        if (localParent->childRidMap.contains(collection.remoteId())) {
+        LocalNode *childNode = localParent->childRidMap.value(collection.remoteId(), 0);
+        if (childNode) {
             if (exactMatch) {
                 *exactMatch = true;
             }
-            return localParent->childRidMap.value(collection.remoteId());
+            return childNode;
         }
         if (exactMatch) {
             *exactMatch = false;
@@ -415,7 +419,7 @@ public:
     /**
       Checks if the given localNode and remoteNode are different
     */
-    bool checkLocalCollection(LocalNode *localNode, RemoteNode *remoteNode) const
+    bool checkLocalCollection(const LocalNode *localNode, const RemoteNode *remoteNode) const
     {
         const Collection &localCollection = localNode->collection;
         const Collection &remoteCollection = remoteNode->collection;
