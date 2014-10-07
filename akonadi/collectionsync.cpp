@@ -178,8 +178,9 @@ public:
 
     void createLocalFetchJob(const Collection &parentCollection)
     {
+        kDebug();
         Job *parent = (currentTransaction ? static_cast<Job *>(currentTransaction) : static_cast<Job *>(q));
-        CollectionFetchJob *job = new CollectionFetchJob(parentCollection, CollectionFetchJob::FirstLevel, parent);
+        CollectionFetchJob *job = new CollectionFetchJob(parentCollection, CollectionFetchJob::Recursive, parent);
         job->fetchScope().setResource(resourceId);
         job->fetchScope().setIncludeUnsubscribed(true);
         job->fetchScope().setAncestorRetrieval(CollectionFetchScope::All);
@@ -208,9 +209,15 @@ public:
     {
         QObject *job = q->sender();
         const RemoteId parentRid = job->property(PARENTCOLLECTIONRID).value<RemoteId>();
+        kDebug() << parentRid.ridChain;
+        localCollections[parentRid] << localCols;
+    }
+
+    void processCollection(const RemoteId &parentRid)
+    {
         QList<Collection> remoteChildren = remoteCollections.value(parentRid);
         QList<Collection> removedChildren = removedRemoteCollections.value(parentRid);
-        QList<Collection> localChildren = localCols;
+        QList<Collection> localChildren = localCollections.value(parentRid);
 
         // Iterate over the list of local children of localParent
         QList<Collection>::Iterator localIter, localEnd,
@@ -224,6 +231,7 @@ public:
             uidRidMap.insert(localIter->id(), localIter->remoteId());
 
             // Try to map removed remote collections (from incremental sync) to local collections
+            // FIXME why is this necessary? Can't we just remove by HRID?
             for (removedIter = removedChildren.begin(), removedEnd = removedChildren.end(); removedIter != removedEnd;)
             {
                 Collection removedCollection = *removedIter;
@@ -297,27 +305,29 @@ public:
         } else {
             removedRemoteCollections.remove(parentRid);
         }
+        kDebug() << removedRemoteCollections.size();
 
         if (!remoteChildren.isEmpty()) {
             remoteCollections[parentRid] = remoteChildren;
         } else {
             remoteCollections.remove(parentRid);
         }
+        kDebug() << remoteCollections.size();
 
         if (!localChildren.isEmpty()) {
-            localCollections[parentRid] += localChildren;
+            localCollections[parentRid] = localChildren;
+        } else {
+            localCollections.remove(parentRid);
         }
+        kDebug() << localCollections.size();
     }
 
-    void localCollectionFetchResult(KJob *job)
+    void processLocalCollections(const RemoteId &parentRid, const Collection &parentCollection)
     {
-        if (job->error()) {
-            return; // handled by the base class
-        }
+        kDebug();
+        const QList<Collection> originalChildren = localCollections.value(parentRid);
 
-        --pendingJobs;
-        const RemoteId parentRid = job->property(PARENTCOLLECTIONRID).value<RemoteId>();
-        const Collection parentCollection = job->property(PARENTCOLLECTION).value<Collection>();
+        processCollection(parentRid);
 
         const QList<Collection> remoteChildren = remoteCollections.take(parentRid);
         const QList<Collection> localChildren = localCollections.take(parentRid);
@@ -334,17 +344,36 @@ public:
             localCollectionsToRemove += localChildren;
         }
 
+        Q_FOREACH (const Collection &c, originalChildren) {
+            processLocalCollections(remoteIdForCollection(c), c);
+        }
+    }
+
+    void localCollectionFetchResult(KJob *job)
+    {
+        if (job->error()) {
+            return; // handled by the base class
+        }
+
+        --pendingJobs;
+
+        processLocalCollections(remoteIdForCollection(Collection::root()), Collection::root());
+
+        // const RemoteId parentRid = job->property(PARENTCOLLECTIONRID).value<RemoteId>();
+        // const Collection parentCollection = job->property(PARENTCOLLECTION).value<Collection>();
+
+
 
         // At this point we have processed all direct descendants of parentRID collection,
         // so we recurse into subtree of each of the descendants
-        CollectionFetchJob *fetchJob = dynamic_cast<CollectionFetchJob*>(job);
-        const Collection::List retrievedChildren = fetchJob->collections();
+        // CollectionFetchJob *fetchJob = dynamic_cast<CollectionFetchJob*>(job);
+        // const Collection::List retrievedChildren = fetchJob->collections();
 
         // FIXME: This is not particulary effective as for each collections we
         // enqueue a new job on the session
-        Q_FOREACH (const Collection &c, retrievedChildren) {
-            createLocalFetchJob(c);
-        }
+        // Q_FOREACH (const Collection &c, retrievedChildren) {
+        //     createLocalFetchJob(c);
+        // }
 
         // If we have processed all local nodes (i.e. there are no more jobs running
         // and last call to createLocalFetchJob did not create any new pending jobs,
